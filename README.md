@@ -4,8 +4,7 @@
 
 # Implementation
 The FFT logic was adapted by watching various YouTube tutorials. Based on those, we wrote a C program, which makes it relatively easier to translate into assembly language, which can be run on Veer Simulator on Ubuntu, while a Python program was made to plot the graphs.
- - A non-vectorized -standard scalar instructions
- - vectorized - RISC-V Vector instructions
+
 
 # Code Structure
 
