@@ -454,16 +454,16 @@ _finish:
 .data  
 
 real:
-    .rept 128
+    .rept 1024
     .float 1.0
     .endr
 
 imag:
-    .rept 128
+    .rept 1024
     .float 0.0
     .endr
 
-.set dataSize, 2048
+.set dataSize, 1024
 
 
     .set halfDataSize, dataSize/2 
