@@ -1,1 +1,302 @@
+#include "macros.s"
 
+.data
+
+.align 2
+N:              .word 256
+
+real:           .space 1024    # 256 floats (4 bytes each)
+imag:           .space 1024
+tw_re:          .space 512     # 128 floats (4 bytes each)
+tw_im:          .space 512
+bitrev:         .space 1024
+out_buf:        .space 1024
+
+.text
+.global main
+
+main:
+    call init_twiddles
+
+    # Generate bit-reversal indices
+    li t0, 0
+    li t1, 8
+    la t2, bitrev
+bitrev_loop:
+    bge t0, 256, bitrev_done
+    mv a0, t0
+    mv a1, t1
+    call reverse_bits
+    sw a0, 0(t2)
+    addi t2, t2, 4
+    addi t0, t0, 1
+    j bitrev_loop
+bitrev_done:
+
+    # Initialize input real with signal + noise, imag = 0
+    li t0, 0
+    la t1, real
+    la t2, imag
+init_input_loop:
+    bge t0, 256, input_init_done
+    li t3, 0x3f800000         # float 1.0
+    sw t3, 0(t1)
+    sw zero, 0(t2)
+    addi t1, t1, 4
+    addi t2, t2, 4
+    addi t0, t0, 1
+    j init_input_loop
+input_init_done:
+
+    call fft_iterative
+
+    # Denoising: zero out all bins except 5 and N-5
+    li t0, 0
+    la t1, real
+    la t2, imag
+denoise_loop:
+    bge t0, 256, denoise_done
+    li t3, 5
+    li t4, 251
+    beq t0, t3, keep_bin
+    beq t0, t4, keep_bin
+    sw zero, 0(t1)
+    sw zero, 0(t2)
+keep_bin:
+    addi t1, t1, 4
+    addi t2, t2, 4
+    addi t0, t0, 1
+    j denoise_loop
+denoise_done:
+
+    call ifft_iterative
+
+    # Copy to out_buf
+    li t0, 0
+    la t1, real
+    la t2, out_buf
+copy_output:
+    bge t0, 256, main_done
+    lw t3, 0(t1)
+    sw t3, 0(t2)
+    addi t1, t1, 4
+    addi t2, t2, 4
+    addi t0, t0, 1
+    j copy_output
+
+main_done:
+    li a0, 0
+    ret
+
+# --- init_twiddles ---
+init_twiddles:
+    li t0, 0                      # i
+    li t1, 128                    # limit = N/2
+    la t2, tw_re
+    la t3, tw_im
+loop_twiddle:
+    bge t0, t1, done_twiddle
+
+    # angle = -2*pi*i/N = -2*3.14159265*i/256
+    # approx angle = -0.0245436926 * i
+    # store cos(angle) to tw_re[i], sin(angle) to tw_im[i]
+
+    # Convert int i to float
+    mv a0, t0
+    call int_to_float
+    fmv.s fa0, fa0
+
+    # Load constant -0.0245436926
+    lui t4, 0xbdc9c              # upper 20 bits of -0.0245436926
+    addi t4, t4, 0xc000
+    fmv.w.x fa1, t4
+
+    fmul.s fa2, fa0, fa1         # angle
+
+    # cos(x) ≈ 1 - x^2/2! + x^4/4!
+    fmul.s fa3, fa2, fa2         # x^2
+    li t5, 0x3f000000            # 0.5
+    fmv.w.x fa4, t5
+    fdiv.s fa3, fa3, fa4         # x^2 / 2
+
+    fsub.s fa5, fa0, fa3         # 1 - x^2/2 ~ cos
+
+    fsw fa5, 0(t2)               # tw_re[i] = cos(angle)
+
+    # sin(x) ≈ x - x^3/6
+    fmul.s fa3, fa2, fa2         # x^2 again
+    fmul.s fa3, fa3, fa2         # x^3
+
+    li t5, 0x40200000            # 6.0
+    fmv.w.x fa4, t5
+    fdiv.s fa3, fa3, fa4         # x^3 / 6
+    fsub.s fa6, fa2, fa3         # x - x^3/6
+
+    fsw fa6, 0(t3)               # tw_im[i] = sin(angle)
+
+    addi t0, t0, 1
+    addi t2, t2, 4
+    addi t3, t3, 4
+    j loop_twiddle
+done_twiddle:
+    ret
+
+# --- int_to_float (a0=int) -> fa0=float ---
+int_to_float:
+    fcvt.s.w fa0, a0
+    ret
+
+# --- reverse_bits(a0 = x, a1 = log2n) ---
+# returns a0 = reversed bits
+reverse_bits:
+    li t0, 0
+    li t1, 0
+rev_loop:
+    bge t1, a1, rev_done
+    slli t0, t0, 1
+    andi t2, a0, 1
+    or t0, t0, t2
+    srli a0, a0, 1
+    addi t1, t1, 1
+    j rev_loop
+rev_done:
+    mv a0, t0
+    ret
+
+# --- fft_iterative ---
+fft_iterative:
+    li t6, 8               # log2n
+
+    # Bit-reversal permutation
+    li t0, 0
+    la t1, real
+    la t2, imag
+    la t3, bitrev
+fft_bitrev_loop:
+    bge t0, 256, fft_bitrev_done
+    slli t4, t0, 2         # offset = i * 4
+    lw t5, 0(t3)           # j = bitrev[i]
+    bge t5, t0, fft_skip_swap
+
+    slli t7, t5, 2
+    la a0, real
+    la a1, imag
+    add a2, a0, t4         # &real[i]
+    add a3, a0, t7         # &real[j]
+    flw ft0, 0(a2)
+    flw ft1, 0(a3)
+    fsw ft1, 0(a2)
+    fsw ft0, 0(a3)
+
+    add a2, a1, t4         # &imag[i]
+    add a3, a1, t7         # &imag[j]
+    flw ft0, 0(a2)
+    flw ft1, 0(a3)
+    fsw ft1, 0(a2)
+    fsw ft0, 0(a3)
+
+fft_skip_swap:
+    addi t0, t0, 1
+    addi t3, t3, 4
+    j fft_bitrev_loop
+
+fft_bitrev_done:
+    li t7, 1               # stage = 1
+fft_stage_loop:
+    bgt t7, t6, fft_done
+    li t0, 1
+    sll t0, t0, t7         # t0 = group_size
+    srli t1, t0, 1         # half_size
+    li t2, 256
+    div t2, t2, t0         # step = N / group_size
+    li t3, 0               # group = 0
+fft_group_loop:
+    bge t3, 256, fft_next_stage
+    li t4, 0               # pair = 0
+fft_pair_loop:
+    bge t4, t1, fft_next_group
+    add t5, t3, t4         # idx1
+    add t6, t5, t1         # idx2
+    mul t8, t4, t2         # tw_idx
+    slli t9, t6, 2
+    la a0, real
+    la a1, imag
+    add a2, a0, t9
+    add a3, a1, t9
+    flw ft0, 0(a2)         # r2
+    flw ft1, 0(a3)         # i2
+    slli t9, t8, 2
+    la a4, tw_re
+    la a5, tw_im
+    add a6, a4, t9
+    add a7, a5, t9
+    flw ft2, 0(a6)         # w_r
+    flw ft3, 0(a7)         # w_i
+    fmul.s ft4, ft2, ft0
+    fmul.s ft5, ft3, ft1
+    fsub.s ft6, ft4, ft5   # t_r
+    fmul.s ft4, ft2, ft1
+    fmul.s ft5, ft3, ft0
+    fadd.s ft7, ft4, ft5   # t_i
+    slli t9, t5, 2
+    add a2, a0, t9
+    add a3, a1, t9
+    flw ft0, 0(a2)         # r1
+    flw ft1, 0(a3)         # i1
+    fadd.s ft4, ft0, ft6
+    fadd.s ft5, ft1, ft7
+    fsw ft4, 0(a2)
+    fsw ft5, 0(a3)
+    fsub.s ft4, ft0, ft6
+    fsub.s ft5, ft1, ft7
+    slli t9, t6, 2
+    add a2, a0, t9
+    add a3, a1, t9
+    fsw ft4, 0(a2)
+    fsw ft5, 0(a3)
+    addi t4, t4, 1
+    j fft_pair_loop
+fft_next_group:
+    addi t3, t3, t0
+    j fft_group_loop
+fft_next_stage:
+    addi t7, t7, 1
+    j fft_stage_loop
+fft_done:
+    ret
+
+# --- ifft_iterative ---
+ifft_iterative:
+    li t0, 0
+    la t1, imag
+negate_imag_loop:
+    bge t0, 256, ifft_call
+    flw ft0, 0(t1)
+    fneg.s ft0, ft0
+    fsw ft0, 0(t1)
+    addi t1, t1, 4
+    addi t0, t0, 1
+    j negate_imag_loop
+ifft_call:
+    call fft_iterative
+    li t0, 0
+    li t2, 256
+    la t3, real
+    la t4, imag
+norm_loop:
+    bge t0, 256, ifft_done
+    flw ft0, 0(t3)
+    flw ft1, 0(t4)
+    li t5, 256
+    fcvt.s.w ft2, t5
+    fdiv.s ft0, ft0, ft2
+    fdiv.s ft1, ft1, ft2
+    fneg.s ft1, ft1
+    fsw ft0, 0(t3)
+    fsw ft1, 0(t4)
+    addi t3, t3, 4
+    addi t4, t4, 4
+    addi t0, t0, 1
+    j norm_loop
+ifft_done:
+    ret
